@@ -1,0 +1,541 @@
+##DADA2 Pipeline##
+source("https://bioconductor.org/biocLite.R")
+biocLite("dada2")
+library(dada2)
+
+#path to fastq files
+path <- "./"
+list.files(path)
+
+#Read names of fastq files and forward and reverse reads match 
+fnFs <- sort(list.files(path, pattern = "_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern = "_R2_001.fastq", full.names = TRUE))
+sample.names <- sapply(strsplit(basename(fnFs), "_"), '[',1)
+
+#Visualize plot quality ****
+#plotQualityProfile(fnFs[11:12])
+#plotQualityProfile(fnRs[11:12])
+
+#Assign files name for filtered fastq.gz files
+filt_path <- file.path(path, "filtered")
+filtFs <- file.path(filt_path, paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(filt_path, paste0(sample.names, "_R_filt.fastq.gz"))
+
+#Filter reads 
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen = c(250, 170),  maxN = 0, maxEE = c(2,5), truncQ = 1, rm.phix = TRUE, compress = TRUE, multithread = TRUE)
+#out
+
+#Learn error rates
+errF <- learnErrors(filtFs, randomize = TRUE, MAX_CONSIST = 100, multithread = TRUE)
+errR <- learnErrors(filtRs, randomize = TRUE, MAX_CONSIST = 100, multithread = TRUE)
+
+#Visualization of the error rates
+#plotErrors(errF, nominalQ = TRUE)
+#plotErrors(errR, nominalQ = TRUE)
+
+#Identifies unique sequences 
+derepFs <- derepFastq(filtFs, verbose = TRUE)
+derepRs <- derepFastq(filtRs, verbose = TRUE)
+
+#Bringing together unique sequence and error learning to see how many sequences are "good" 
+dadaFs <- dada(derepFs, err = errF, multithread = TRUE)
+dadaRs <- dada(derepRs, err = errR, multithread = TRUE)
+
+#Inspect object
+#dadaFs[[1]]
+
+#Merge forward and reverse reads
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose = TRUE)
+
+#Create amplicon sequence variant table (ASV) (similar to OTU)
+seqtab <- makeSequenceTable(mergers)
+
+#Remove chimeras****
+seqtab.nochim <- removeBimeraDenovo(seqtab, method = "pooled", multithread = TRUE, verbose = TRUE)
+
+#Create ASV table 
+#write.csv(seqtab.nochim, "Eco_ITS_otutable.csv", sep = ",")
+
+#Demensions of ASV table samples:ASVs 
+dim(seqtab.nochim)
+
+#Percentage of sequence retained after chimera removal 
+sum(seqtab.nochim)/sum(seqtab) 
+
+#Number of reads per step 
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(mergers, getN), rowSums(seqtab), rowSums(seqtab.nochim))
+colnames(track) <- c("input", "filtered", "denoised", "merged", "tabled", "nonchim")
+rownames(track) <- sample.names
+head(track)
+track
+write.csv(track, file = "Eco16sDADAoutput.csv")
+
+#Assign taxonomy and create taxonomy table 
+taxa <- assignTaxonomy(seqtab.nochim, "sh_general_release_dynamic_s_10.10.2017.fasta", tryRC = TRUE, multithread = TRUE)
+write.csv(taxa, "Eco_16s_taxonomy.csv")
+
+#Save image
+save.image("Eco_16s_dada.Rdata")
+
+#Bring in meta file
+meta = read.csv("/Users/emmabuczkowski/Desktop/Eco_16S_dada2_output_files/Eco_meta_full.csv", header = TRUE, sep = ",")
+row.names(meta) = row.names(seqtab.nochim)
+
+#only needed if saved image is messed up
+meta = read.csv("Eco_meta_full copy.csv", header = TRUE, sep = ",")
+otu = read.csv("Eco_16s_otutable.csv", header = TRUE, sep = ",")
+taxa = read.csv("Eco_16s_taxonomy.csv", header = TRUE, sep = ",")
+
+#Making row names consistent in files 
+row.names(otu) = otu$X
+otu = otu[,-1]
+row.names(meta) = row.names(otu)
+row.names(taxa) = taxa$X
+taxa = taxa[,-1]
+getwd()
+
+#change from dataframe into a matrix for phyloseq object 
+taxa = as.matrix(taxa)
+
+#Ordering meta file factors and making them into factors 
+meta$Microhabitiat_F = as.character(meta$Microhabitat)
+meta$Microhabitat = as.factor(meta$Microhabitat)
+meta$Microhabitat = factor(meta$Microhabitat, levels = c("Leaf", "Thatch", "Rhizosphere", "Bulk"))
+
+meta$Location_F = as.character(meta$Location)
+meta$Location = as.factor(meta$Location)
+meta$Location = factor(meta$Location, levels = c("Creeping Bent Greens", "Creeping Bent Fairway", "Tall Fescue", "Natural"))
+
+meta$Grass_F = as.character(meta$Grass)
+meta$Grass = as.factor(meta$Grass)
+meta$Grass = factor(meta$Grass, levels = c("Creeping Bent", "Tall Fescue", "Natural"))
+
+meta$Soil_F = as.character(meta$Soil)
+meta$Soil = as.factor(meta$Soil)
+meta$Soil = factor(meta$Soil, levels = c("Sandy", "Silt Loam"))
+
+#Only add for Deseq2 code
+#make sure to change ps code and then recreate the phyloseq object
+#otu.1 = otu+1
+
+#Create phyloseq object
+ps = phyloseq(otu_table(otu, taxa_are_rows = FALSE), tax_table(taxa), sample_data(meta))
+ps = prune_samples(sample_sums(ps)>1000,ps)
+
+#normalize phyloseq object 
+ps.norm = transform_sample_counts(ps, function(x) x / sum(x))
+
+#Save image 
+save.image("Eco_16s_dada.RData")
+
+load("Eco_16s_dada.RData")
+
+##DATA ANALYSIS SET UP##
+
+#loading packages 
+#libraries MUST be in this order!!!
+library("ggplot2")
+library("phyloseq")
+library("tidyr")
+library("vegan")
+library("plyr")
+library("dplyr")
+library("DESeq2")
+
+
+#only needed if saved image is messed up
+meta = read.csv("Eco_meta_full.csv", header = TRUE, sep = ",")
+otu = read.csv("Eco_16s_AWS_otutable.csv", header = TRUE, sep = ",")
+taxa = read.csv("Eco_16s_AWS_taxonomy.csv", header = TRUE, sep = ",")
+
+#Making row names consistent in files 
+row.names(otu) = otu$X
+otu = otu[,-1]
+row.names(meta) = row.names(otu)
+row.names(taxa) = taxa$X
+taxa = taxa[,-1]
+
+#change from dataframe into a matrix for phyloseq object 
+taxa = as.matrix(taxa)
+
+#Ordering meta file factors and making them into factors 
+meta$Microhabitat_F = as.character(meta$Microhabitat)
+meta$Microhabitat = as.factor(meta$Microhabitat)
+meta$Microhabitat = factor(meta$Microhabitat, levels = c("Leaf", "Thatch", "Rhizosphere", "Bulk"))
+
+meta$Location_F = as.character(meta$Location)
+meta$Location = as.factor(meta$Location)
+meta$Location = factor(meta$Location, levels = c("Creeping Bent Greens", "Creeping Bent Fairway", "Tall Fescue", "Natural"))
+
+meta$Grass_F = as.character(meta$Grass)
+meta$Grass = as.factor(meta$Grass)
+meta$Grass = factor(meta$Grass, levels = c("Creeping Bent", "Tall Fescue", "Natural"))
+
+meta$Soil_F = as.character(meta$Soil)
+meta$Soil = as.factor(meta$Soil)
+meta$Soil = factor(meta$Soil, levels = c("Sandy", "Silt Loam"))
+
+#Create phyloseq object
+ps = phyloseq(otu_table(otu, taxa_are_rows = FALSE), tax_table(taxa), sample_data(meta))
+
+#normalize phyloseq object 
+ps.norm = transform_sample_counts(ps, function(x) x / sum(x))
+
+#Save image 
+save.image("Eco_16s_dada.RData")
+
+#load image (START HERE AFTER INITIAL DATA PROCESSING)
+load("Eco_16s_dada.RData")
+
+#Creating remainder category 
+# agglomerate taxa
+glom <- tax_glom(ps.norm, taxrank = 'Phylum')
+
+# create dataframe from phyloseq object
+dat <- psmelt(glom)
+
+# convert Phylum to a character vector from a factor because R
+dat$Phylum <- as.character(dat$Phylum)
+
+# group dataframe by Phylum, calculate median rel. abundance
+medians <- ddply(dat, ~Phylum, function(x) c(median=median(x$Abundance)))
+
+# find Phyla whose rel. abund. is less than 1%
+remainder <- medians[medians$median <= 0.01,]$Phylum
+
+# change their name to "Remainder"
+dat[dat$Phylum %in% remainder,]$Phylum <- 'Remainder'
+
+
+# Group by treatments and find the average abundance for each phylum for stacked bar plot 
+dat.plot = dat%>%
+  group_by(Microhabitat,Location,Phylum,Sample)%>%
+  summarize(Abundance=sum(Abundance))%>%
+  group_by(Microhabitat,Location,Phylum)%>%
+  summarize(MeanAbundance = mean(Abundance))
+
+# Color palette for stacked bar graph:
+cbbPalette <- c( "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00","#CC79A7", "#663399", "#999999")
+#color palette for nmds:
+cbbPalette <- c( "#E69F00", "#56B4E9", "#009E73", "#CC79A7", "#F0E442", "#0072B2", "#D55E00", "#663399", "#999999")
+
+##DATA ANALYSIS##
+
+#stacked bar plot 
+ggplot(dat.plot,aes(x=Microhabitat, y=MeanAbundance, fill=Phylum)) + 
+  geom_bar(stat = "identity") + 
+  facet_grid(~Location, scale="free") + xlab("Microhabitat") + ylab("Mean Relative Abundace") + ggtitle("Mean Relative Abundance of Bacterial Phyla for Grass Species and Microhabitat") +
+  labs(fill = "Bacterial Phyla") + theme_bw(base_size=11, base_family="Times") + scale_fill_manual(values=cbbPalette) + 
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle=45, hjust=1))
+ggsave("Relative Abundance of Bacterial Phyla Based on Grass Species and Microhabitat.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+#NMDS of total data 
+ord.nmds.bray <- ordinate(ps.norm, method = "NMDS", distance = "bray")
+plot_ordination(ps.norm, ord.nmds.bray, color="Location", shape = "Microhabitat", title="Bray-Curtis NMDS of Bacterial Communities") + 
+  theme_bw(base_size=11, base_family="Times") + scale_colour_manual(values=cbbPalette) + 
+  theme(plot.title = element_text(hjust = 0.5)) + geom_point(size = 6)
+ggsave("Bray-Curtis NMDS of Bacterial Communities.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+
+##PERMANOVA##
+
+#running adonis/betadisper with only grasses with silt loam 
+ps.grass = subset_samples(ps.norm, Soil == "Silt Loam")
+ps.bg = phyloseq::distance(ps.grass, method = "bray")
+D = data.frame(sample_data(ps.grass))
+adonis(ps.bg ~ Grass, data = D)
+betagrass = betadisper(ps.bg, D$Grass)
+permutest(betagrass)
+
+#Betadisper graph
+png("betagrass.png", width = 7, height = 8.2, units = "in", res = 600)
+par(family="Times")
+plot(betagrass, col = c("#E69F00", "#009E73", "#CC79A7"), hull = FALSE, ellipse = TRUE)
+dev.off()
+
+#running adonis/betadisper with only creeping bent to compare soil types
+ps.soil = subset_samples(ps.norm, Grass == "Creeping Bent")
+ps.bs = phyloseq::distance(ps.soil, method = "bray")
+D = data.frame(sample_data(ps.soil))
+adonis(ps.bs ~ Soil, data = D)
+betasoil = betadisper(ps.bs, D$Soil)
+permutest(betasoil)
+
+#betadisper graph
+png("betasoil.png", width = 7, height = 8.2, units = "in", res = 600)
+par(family="Times")
+plot(betasoil, col = c("#E69F00", "#56B4E9"), hull = FALSE, ellipse = TRUE)
+dev.off()
+
+#running adonis/betadisper for microhabitat
+#Create distance matrix 
+ps.bray = phyloseq::distance(ps.norm, method = "bray")
+
+#Turn sample data into a datafram 
+D = data.frame(sample_data(ps.norm))
+
+#Use adonis function to perform PERMANOVA of all variables 
+adonis(ps.bray ~ Microhabitat, data = D)
+
+#check assumptions of PERMANOVA test 
+betamicrohabitat = betadisper(ps.bray, D$Microhabitat)
+permutest(betamicrohabitat)
+
+#creation of graph for betadisper 
+png("betamic.png", width = 7, height = 8.2, units = "in", res = 600)
+par(family="Times")
+plot(betamicrohabitat, col = c("#F0E442", "#663399", "#D55E00", "#0072B2"), hull = FALSE, ellipse = TRUE)
+dev.off()
+
+#running microhabitat and grass interaction 
+adonis(ps.bg ~ Grass*Microhabitat, data = D)
+
+#running microhabitats separate 
+#Leaf
+ps.mic = subset_samples(ps.norm, Soil == "Silt Loam" & Microhabitat == "Leaf")
+ps.micro = phyloseq::distance(ps.mic, method = "bray")
+D = data.frame(sample_data(ps.mic))
+adonis(ps.micro ~ Grass, data = D)
+betaleaf = betadisper(ps.micro, D$Grass)
+permutest(betaleaf)
+
+#betadisper graph
+png("betaleaf.png", width = 7, height = 8.2, units = "in", res = 600)
+par(family="Times")
+plot(betaleaf, col = c("#E69F00", "#009E73", "#CC79A7"), hull = FALSE, ellipse = TRUE)
+dev.off()
+
+#Thatch
+ps.mic = subset_samples(ps.norm, Soil == "Silt Loam" & Microhabitat == "Thatch")
+ps.micro = phyloseq::distance(ps.mic, method = "bray")
+D = data.frame(sample_data(ps.mic))
+adonis(ps.micro ~ Grass, data = D)
+betathatch = betadisper(ps.micro, D$Grass)
+permutest(betathatch)
+
+#betadisper graph
+png("betathatch.png", width = 7, height = 8.2, units = "in", res = 600)
+par(family="Times")
+plot(betathatch, col = c("#E69F00", "#009E73", "#CC79A7"), hull = FALSE, ellipse = TRUE)
+dev.off()
+
+#rhizosphere
+ps.mic = subset_samples(ps.norm, Soil == "Silt Loam" & Microhabitat == "Rhizosphere")
+ps.micro = phyloseq::distance(ps.mic, method = "bray")
+D = data.frame(sample_data(ps.mic))
+adonis(ps.micro ~ Grass, data = D)
+betarhizosphere = betadisper(ps.micro, D$Grass)
+permutest(betarhizosphere)
+
+#betadisper graph
+png("betarhi.png", width = 7, height = 8.2, units = "in", res = 600)
+par(family="Times")
+plot(betarhizosphere, col = c("#E69F00", "#009E73", "#CC79A7"), hull = FALSE, ellipse = TRUE)
+dev.off()
+
+#bulk
+ps.mic = subset_samples(ps.norm, Soil == "Silt Loam" & Microhabitat == "Bulk")
+ps.micro = phyloseq::distance(ps.mic, method = "bray")
+D = data.frame(sample_data(ps.mic))
+adonis(ps.micro ~ Grass, data = D)
+betabulk = betadisper(ps.micro, D$Grass)
+permutest(betabulk)
+
+#betadisper graph
+png("betabulk.png", width = 7, height = 8.2, units = "in", res = 600)
+par(family="Times")
+plot(betabulk, col = c("#E69F00", "#009E73", "#CC79A7"), hull = FALSE, ellipse = TRUE)
+dev.off()
+
+#Phylum boxplots of location on section x 
+totalbox = ggplot(dat,aes(x=Microhabitat, y=Abundance, color=Location)) + geom_boxplot() + facet_wrap(~Phylum, scales ="free") + 
+  expand_limits(y=0) + theme(plot.title = element_text(hjust = 0.5)) + theme_bw(base_size=11, base_family="Times") + 
+  scale_color_manual(values=cbbPalette)+ theme(plot.title = element_text(hjust = 0.5),axis.text.x=element_text(angle=45, hjust=1)) + ggtitle("Abundance of Bacterial Phyla for Plot Location") + labs(color = "Plot Location") 
+
+#save graph 
+ggsave("Abundance of Bacterial Phyla for Plot Location.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+
+#Deseq2 
+sample.data = sample_data(ps)
+
+Dif_Abund = function(Microhabitat, Location){
+  ps.pruned <- prune_samples(((sample_data(ps)$Location_F == Location) & (sample_data(ps)$Microhabitat_F == Microhabitat)) | ((sample_data(ps)$Location_F == "Natural") & (sample_data(ps)$Microhabitat_F == Microhabitat)),ps)
+  dseq = phyloseq_to_deseq2(ps.pruned, ~ Location)
+  dseq$Location = relevel(dseq$Location,"Natural")
+  dseq = DESeq(dseq, quiet = TRUE, fitType="local")
+  taxonomy = data.frame(tax_table(ps.pruned))
+  results = results(dseq)
+  results$Microhabitat = Microhabitat
+  results$Location = Location
+  results = data.frame(results$Microhabitat,results$Location,rownames(results),results$baseMean,results$log2FoldChange,results$lfcSE,results$pvalue,taxonomy)
+  colnames(results)[1:7] = c("Microhabitat","Location","OTU","baseMean","l2FC","SE","pvalue")
+  results
+}
+
+variables = expand.grid(Location = c("Creeping Bent Greens", "Creeping Bent Fairway", "Tall Fescue"), Microhabitat = c("Leaf", "Thatch", "Rhizosphere", "Bulk"))
+variables
+
+DA<-mdply(variables,Dif_Abund)
+head(DA)
+
+threshold = function (thresh){
+  dplyr::filter(DA, baseMean >= thresh) %>% 
+    dplyr::mutate(padj = p.adjust(pvalue,"BH")) %>%
+    dplyr::summarize(cutoff=thresh, count=sum(padj<=0.10, na.rm = TRUE))
+}
+
+range = seq(0,3,0.05)
+thresh.s <- ldply(range, threshold)
+plot(thresh.s$count~thresh.s$cutoff)
+
+group_by(DA, Location) %>%
+  mutate(Total=sum(baseMean)) %>%
+  filter(baseMean>=0.1) %>% 
+  mutate(padj = p.adjust(pvalue,"BH")) %>% 
+  write.csv("SecLoc.csv", row.names=FALSE)
+
+N=read.csv("SecLoc.csv")
+N.1 = subset(N, padj <= 0.1)
+N.1 = subset(N.1, Phylum != "NA")
+
+#Creeping bent fairway 
+N.CBF.Leaf = subset(N.1, Location == "Creeping Bent Fairway")
+N.CBF.Leaf = subset(N.CBF.Leaf, Microhabitat == "Leaf")
+N.CBF.Leaf = N.CBF.Leaf[order(-N.CBF.Leaf$l2FC),]
+n = dim(N.CBF.Leaf)[1]
+N.CBF.Leaf = N.CBF.Leaf[c(1:10, (n-9):n),]
+ggplot(N.CBF.Leaf) + geom_point(aes(x = Genus, y = l2FC), size = 4) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + xlab("") + 
+  ggtitle("Creeping Bent Fairway Leaf") + 
+  theme_bw(base_size=11, base_family="Times") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(hjust = 0.5),axis.text.x=element_text(angle=45, hjust=1))
+ggsave("Creeping Bent Fairway Leaf.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+N.CBF.Thatch = subset(N.1, Location == "Creeping Bent Fairway")
+N.CBF.Thatch = subset(N.CBF.Thatch, Microhabitat == "Thatch")
+N.CBF.Thatch = N.CBF.Thatch[order(-N.CBF.Thatch$l2FC),]
+n = dim(N.CBF.Thatch)[1]
+N.CBF.Thatch = N.CBF.Thatch[c(1:10, (n-9):n),]
+ggplot(N.CBF.Thatch) + geom_point(aes(x = Genus, y = l2FC), size = 4) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + xlab("") + 
+  ggtitle("Creeping Bent Fairway Thatch") + 
+  theme_bw(base_size=11, base_family="Times") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(hjust = 0.5),axis.text.x=element_text(angle=45, hjust=1))
+ggsave("Creeping Bent Fairway Thatch.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+N.CBF.Rhizosphere = subset(N.1, Location == "Creeping Bent Fairway")
+N.CBF.Rhizosphere = subset(N.CBF.Rhizosphere, Microhabitat == "Rhizosphere")
+N.CBF.Rhizosphere = N.CBF.Rhizosphere[order(-N.CBF.Rhizosphere$l2FC),]
+n = dim(N.CBF.Rhizosphere)[1]
+N.CBF.Rhizosphere = N.CBF.Rhizosphere[c(1:10, (n-9):n),]
+ggplot(N.CBF.Rhizosphere) + geom_point(aes(x = Genus, y = l2FC), size = 4) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + xlab("") + 
+  ggtitle("Creeping Bent Fairway Rhizosphere") + 
+  theme_bw(base_size=11, base_family="Times") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(hjust = 0.5),axis.text.x=element_text(angle=45, hjust=1))
+ggsave("Creeping Bent Fairway Rhizosphere.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+
+N.CBF.Bulk = subset(N.1, Location == "Creeping Bent Fairway")
+N.CBF.Bulk = subset(N.CBF.Bulk, Microhabitat == "Bulk")
+N.CBF.Bulk = N.CBF.Bulk[order(-N.CBF.Bulk$l2FC),]
+n = dim(N.CBF.Bulk)[1]
+N.CBF.Bulk = N.CBF.Bulk[c(1:10, (n-9):n),]
+ggplot(N.CBF.Bulk) + geom_point(aes(x = Genus, y = l2FC), size = 4) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + xlab("") + 
+  ggtitle("Creeping Bent Fairway Bulk") + 
+  theme_bw(base_size=11, base_family="Times") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(hjust = 0.5),axis.text.x=element_text(angle=45, hjust=1))
+ggsave("Creeping Bent Fairway Bulk.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+#Creeping bent greens 
+N.CBG.Leaf = subset(N.1, Location == "Creeping Bent Greens")
+N.CBG.Leaf = subset(N.CBG.Leaf, Microhabitat == "Leaf")
+N.CBG.Leaf = N.CBG.Leaf[order(-N.CBG.Leaf$l2FC),]
+n = dim(N.CBG.Leaf)[1]
+N.CBG.Leaf = N.CBG.Leaf[c(1:10, (n-9):n),]
+ggplot(N.CBG.Leaf) + geom_point(aes(x = Genus, y = l2FC), size = 4) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + xlab("") + 
+  ggtitle("Creeping Bent Greens Leaf") + 
+  theme_bw(base_size=11, base_family="Times") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(hjust = 0.5),axis.text.x=element_text(angle=45, hjust=1))
+ggsave("Creeping Bent Greens Leaf.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+N.CBG.Thatch = subset(N.1, Location == "Creeping Bent Greens")
+N.CBG.Thatch = subset(N.CBG.Thatch, Microhabitat == "Thatch")
+N.CBG.Thatch = N.CBG.Thatch[order(-N.CBG.Thatch$l2FC),]
+n = dim(N.CBG.Thatch)[1]
+N.CBG.Thatch = N.CBG.Thatch[c(1:10, (n-9):n),]
+ggplot(N.CBG.Thatch) + geom_point(aes(x = Genus, y = l2FC), size = 4) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + xlab("") + 
+  ggtitle("Creeping Bent Greens Thatch") + 
+  theme_bw(base_size=11, base_family="Times") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(hjust = 0.5),axis.text.x=element_text(angle=45, hjust=1))
+ggsave("Creeping Bent Greens Thatch.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+N.CBG.Rhizosphere = subset(N.1, Location == "Creeping Bent Greens")
+N.CBG.Rhizosphere = subset(N.CBG.Rhizosphere, Microhabitat == "Rhizosphere")
+N.CBG.Rhizosphere = N.CBG.Rhizosphere[order(-N.CBG.Rhizosphere$l2FC),]
+n = dim(N.CBG.Rhizosphere)[1]
+N.CBG.Rhizosphere = N.CBG.Rhizosphere[c(1:10, (n-9):n),]
+ggplot(N.CBG.Rhizosphere) + geom_point(aes(x = Genus, y = l2FC), size = 4) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + xlab("") + 
+  ggtitle("Creeping Bent Greens Rhizosphere") + 
+  theme_bw(base_size=11, base_family="Times") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(hjust = 0.5),axis.text.x=element_text(angle=45, hjust=1))
+ggsave("Creeping Bent Greens Rhizosphere.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+
+N.CBG.Bulk = subset(N.1, Location == "Creeping Bent Greens")
+N.CBG.Bulk = subset(N.CBG.Bulk, Microhabitat == "Bulk")
+N.CBG.Bulk = N.CBG.Bulk[order(-N.CBG.Bulk$l2FC),]
+n = dim(N.CBG.Bulk)[1]
+N.CBG.Bulk = N.CBG.Bulk[c(1:10, (n-9):n),]
+ggplot(N.CBG.Bulk) + geom_point(aes(x = Genus, y = l2FC), size = 4) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + xlab("") + 
+  ggtitle("Creeping Bent Greens Bulk") + 
+  theme_bw(base_size=11, base_family="Times") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(hjust = 0.5),axis.text.x=element_text(angle=45, hjust=1))
+ggsave("Creeping Bent Greens Bulk.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+#Tall Fescue
+N.TF.Leaf = subset(N.1, Location == "Tall Fescue")
+N.TF.Leaf = subset(N.TF.Leaf, Microhabitat == "Leaf")
+N.TF.Leaf = N.TF.Leaf[order(-N.TF.Leaf$l2FC),]
+n = dim(N.TF.Leaf)[1]
+N.TF.Leaf = N.TF.Leaf[c(1:10, (n-9):n),]
+ggplot(N.TF.Leaf) + geom_point(aes(x = Genus, y = l2FC), size = 4) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + xlab("") + 
+  ggtitle("Tall Fescue Leaf") + 
+  theme_bw(base_size=11, base_family="Times") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(hjust = 0.5),axis.text.x=element_text(angle=45, hjust=1))
+ggsave("Tall Fescue Leaf.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+N.TF.Thatch = subset(N.1, Location == "Tall Fescue")
+N.TF.Thatch = subset(N.TF.Thatch, Microhabitat == "Thatch")
+N.TF.Thatch = N.TF.Thatch[order(-N.TF.Thatch$l2FC),]
+n = dim(N.TF.Thatch)[1]
+N.TF.Thatch = N.TF.Thatch[c(1:10, (n-9):n),]
+ggplot(N.TF.Thatch) + geom_point(aes(x = Genus, y = l2FC), size = 4) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + xlab("") + 
+  ggtitle("Tall Fescue Thatch") + 
+  theme_bw(base_size=11, base_family="Times") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(hjust = 0.5),axis.text.x=element_text(angle=45, hjust=1))
+ggsave("Tall Fescue Thatch.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+N.TF.Rhizosphere = subset(N.1, Location == "Tall Fescue")
+N.TF.Rhizosphere = subset(N.TF.Rhizosphere, Microhabitat == "Rhizosphere")
+N.TF.Rhizosphere = N.TF.Rhizosphere[order(-N.TF.Rhizosphere$l2FC),]
+n = dim(N.TF.Rhizosphere)[1]
+N.TF.Rhizosphere = N.TF.Rhizosphere[c(1:10, (n-9):n),]
+ggplot(N.TF.Rhizosphere) + geom_point(aes(x = Genus, y = l2FC), size = 4) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + xlab("") + 
+  ggtitle("Tall Fescue Rhizosphere") + 
+  theme_bw(base_size=11, base_family="Times") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(hjust = 0.5),axis.text.x=element_text(angle=45, hjust=1))
+ggsave("Tall Fescue Rhizosphere.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+N.TF.Bulk = subset(N.1, Location == "Tall Fescue")
+N.TF.Bulk = subset(N.TF.Bulk, Microhabitat == "Bulk")
+N.TF.Bulk = N.TF.Bulk[order(-N.TF.Bulk$l2FC),]
+n = dim(N.TF.Bulk)[1]
+N.TF.Bulk = N.TF.Bulk[c(1:10, (n-9):n),]
+ggplot(N.TF.Bulk) + geom_point(aes(x = Genus, y = l2FC), size = 4) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + xlab("") + 
+  ggtitle("Tall Fescue Bulk") + 
+  theme_bw(base_size=11, base_family="Times") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(hjust = 0.5),axis.text.x=element_text(angle=45, hjust=1))
+ggsave("Tall Fescue Bulk.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+#do not need natural because that is what the other data is being compared to
+
