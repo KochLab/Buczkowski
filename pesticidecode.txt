@@ -1,0 +1,421 @@
+#Load packages
+library("phyloseq")
+library("ggplot2")
+library("plyr")
+library("dplyr")
+library("vegan")
+
+#bring in files
+meta = read.csv("Fungicide_metadata.csv", header = TRUE, sep = ",")
+otu = read.csv("Fungicide_otu_table.csv", header = TRUE, sep = ",")
+taxa = read.csv("Fungicide_tax_table.csv", header = TRUE, sep = ",")
+otu[1:5,1:5]
+otu_table(ps)[1:5,1:5]
+#Save files in R
+save.image("phyto.RData")
+
+#load saved image 
+load("phyto.RData")
+
+#Making row names consistent in files 
+row.names(otu) = otu$X
+otu = otu[,-1]
+row.names(meta) = row.names(otu)
+row.names(taxa) = taxa$X
+taxa = taxa[,-1]
+
+#change from dataframe into a matrix for phyloseq object 
+taxa = as.matrix(taxa)
+
+#ordering meta file factors 
+meta$Time_F = as.character(meta$Time)
+meta$Time = as.factor(meta$Time)
+meta$Time = factor(meta$Time.Point, levels = c("Day_0", "Day_1", "Day_3", "Day_7", "Day_14", "Day_21"))
+
+meta$Treatment_F = as.character(meta$Treatment)
+meta$Treatment = as.factor(meta$Treatment)
+meta$Treatment = factor(meta$Treatment, levels = c("Nontreated", "Boscalid", "Chlorothalonil", ""))
+
+meta$Plot_F = as.character(meta$Plot)
+meta$Plot = as.factor(meta$Plot)
+meta$Plot = factor(meta$Plot.Type, levels = c("Grass", "Soil"))
+
+meta$Replicate = as.character(meta$Replicate)
+meta$Replicate = factor(meta$Replicate, levels = c("1", "2", "3"))
+
+meta$Pesticide = factor(meta$Pesticide_type, levels = c("None", "Fungicide"))
+meta$Toxicity = factor(meta$Toxicity, levels = c("None", "Low", "High"))
+
+#making phyloseq object 
+ps = phyloseq(otu_table(otu, taxa_are_rows = FALSE), tax_table(taxa), sample_data(meta))
+
+#normalize phyloseq object 
+ps.norm = transform_sample_counts(ps, function(x) x / sum(x))
+
+#Save files in R
+save.image("phyto_1.RData")
+
+#load in saved image (begin here after initial normalization step)
+load("phyto_1.RData")
+
+#subsetting grass plots 
+ps.grass = subset_samples(ps.norm, Plot == "Grass")
+#subsetting soil plots 
+ps.soil = subset_samples(ps.norm, Plot == "Soil")
+
+#Creating remainder category 
+# agglomerate taxa
+glomg <- tax_glom(ps.grass, taxrank = 'Phylum')
+gloms <- tax_glom(ps.soil, taxrank = 'Phylum')
+
+# create dataframe from phyloseq object
+datg <- psmelt(glomg)
+dats <- psmelt(gloms)
+
+# convert Phylum to a character vector from a factor because R
+datg$Phylum <- as.character(datg$Phylum)
+dats$Phylum <- as.character(dats$Phylum)
+
+# group dataframe by Phylum, calculate median rel. abundance
+medians.g <- ddply(datg, ~Phylum, function(x) c(median=median(x$Abundance)))
+medians.s <- ddply(dats, ~Phylum, function(x) c(median=median(x$Abundance)))
+
+# find Phyla whose rel. abund. is less than 1%
+remainder.g <- medians.g[medians.g$median <= 0.01,]$Phylum
+remainder.s <- medians.s[medians.s$median <= 0.01,]$Phylum
+
+# change their name to "Remainder"
+datg[datg$Phylum %in% remainder.g,]$Phylum <- 'Remainder'
+dats[dats$Phylum %in% remainder.s,]$Phylum <- 'Remainder'
+
+# Group by treatments and find the average abundance for each phylum
+dat.plot.g = datg%>%
+  group_by(Time,Treatment,Phylum,Sample)%>%
+  summarize(Abundance=sum(Abundance))%>%
+  group_by(Time,Treatment,Phylum)%>%
+  summarize(MeanAbundance = mean(Abundance))
+
+dat.plot.s = dats%>%
+  group_by(Time,Treatment,Phylum,Sample)%>%
+  summarize(Abundance=sum(Abundance))%>%
+  group_by(Time,Treatment,Phylum)%>%
+  summarize(MeanAbundance = mean(Abundance))
+
+##DATA ANALYSIS##
+
+#Objective 1 
+##PERMANOVA##
+#Create distance matrix 
+ps.bray = phyloseq::distance(ps.norm, method = "bray")
+
+#Turn sample data into a datafram 
+D2 = data.frame(sample_data(ps.norm))
+
+#testing plot significance for just day 0
+ps.day.0 = subset_samples(ps.norm, Time == "Day_0")
+ps.bray.0 = phyloseq::distance(ps.day.0, method = "bray")
+DF.0 = data.frame(sample_data(ps.day.0))
+
+#testing plot significance 
+adonis(ps.bray.0 ~ Plot, data = DF.0)
+
+betaplot = betadisper(ps.bray.0, DF.0$Plot)
+permutest(betaplot)
+
+#plot betadisper 
+png("betaplot.png", width = 7, height = 8.2, units = "in", res = 600)
+par(family="Times")
+plot(betaplot, col = c("#009E73", "#D55E00"), hull = FALSE, ellipse = TRUE)
+dev.off()
+
+#color palette for plot NMDS
+cbbPalette <- c("#009E73", "#D55E00")
+
+#testing plot interactions
+adonis(ps.bray ~ Plot*Time*Treatment, data = D2)
+
+#plot NMDS
+ord.nmds.bray <- ordinate(ps.norm, method = "NMDS", distance = "bray")
+p4 = plot_ordination(ps.norm, ord.nmds.bray, color="Plot") + 
+  stat_ellipse(aes(fill = NA), geom = "polygon", show.legend = FALSE) + 
+  scale_fill_manual(values = cbbPalette) +
+  theme_bw(base_size=11, base_family="Times") +
+  scale_color_manual(values=cbbPalette) + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  theme(legend.title = element_blank())
+
+p4 
+ggsave("plot.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+#Relative abundance graphs#
+
+#color palette for stacked bar graph:
+cbbPalette.turf <- c( "#E69F00", "#56B4E9", "#009E73", "#CC79A7", "#F0E442", "#0072B2", "#D55E00", "#663399", "#66CC99","#CC99FF", "#009999", "#FF99CC", "#999999")
+cbbPalette.soil <- c("#E69F00", "#56B4E9", "#009E73", "#CC79A7", "#F0E442", "#FF99CC", "#0072B2", "#999999", "#D55E00", "#663399", "#66CC99","#CC99FF", "#009999")
+
+#Want to split data by plot type and run separately 
+#stacked bar plot for grass
+ggplot(dat.plot.g,aes(x=Time, y=MeanAbundance, fill=Phylum)) + 
+  geom_bar(stat = "identity") + 
+  facet_grid(~Treatment, scale = "free") + ylab("Mean Relative Abundance") + 
+  labs(fill = "Bacterial Phyla") + theme_bw(base_size=11, base_family="Times") + 
+  scale_fill_manual(values=cbbPalette.turf) + theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle=45, hjust=1))
+ggsave("stackedgrass.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+#stacked bar plot for soil
+ggplot(dat.plot.s,aes(x=Time, y=MeanAbundance, fill=Phylum)) + 
+  geom_bar(stat = "identity") + 
+  facet_grid(~Treatment, scale = "free") + ylab("Mean Relative Abundance") + 
+  labs(fill = "Bacterial Phyla") + theme_bw(base_size=11, base_family="Times") + 
+  scale_fill_manual(values=cbbPalette.soil) + theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle=45, hjust=1))
+ggsave("stackedsoil.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+#Want to see if certain taxa from soil stacked bar graph are present in the turf stacked bar graph to make accurate conclusions
+xx = tax_table(subset_taxa(ps.grass, Phylum == "Gemmatimonadetes"))
+taxa.look.gemma = subset(dat.plot.g, Phylum == "Gemmatimonadetes")
+taxa.look.nitro = subset(dat.plot.g, Phylum == "Nitrospirae")
+
+#Testing interaction between time and treatment 
+ps.bg = phyloseq::distance(ps.grass, method = "bray")
+D = data.frame(sample_data(ps.grass))
+adonis(ps.bg ~ Time*Treatment, data = D)
+
+ps.bs = phyloseq::distance(ps.soil, method = "bray")
+D1 = data.frame(sample_data(ps.soil))
+adonis(ps.bs ~ Time*Treatment, data = D1)
+
+#color palette for treatment/time NMDS
+cbbPalette <- c("#E69F00", "#56B4E9", "#CC79A7")
+
+#NMDS of treatment and time for grass plots 
+ord.nmds.bray <- ordinate(ps.grass, method = "NMDS", k=3, distance = "bray")
+plot_ordination(ps.grass, ord.nmds.bray, color="Treatment", shape = "Time") + 
+  theme_bw(base_size=11, base_family="Times") + scale_colour_manual(values=cbbPalette) + theme(plot.title = element_text(hjust = 0.5)) + geom_point(size = 6)
+ggsave("NMDSgrass.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+#NMDS of soil plots
+ord.nmds.bray <- ordinate(ps.soil, method = "NMDS", k=3, distance = "bray")
+plot_ordination(ps.soil, ord.nmds.bray, color="Treatment", shape = "Time") + 
+  theme_bw(base_size=11, base_family="Times") + scale_colour_manual(values=cbbPalette) + theme(plot.title = element_text(hjust = 0.5)) + geom_point(size = 6)
+ggsave("NMDSsoil.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+#objective 2: test for treatment
+
+#PERMANOVA and betadisper of grass 
+adonis(ps.bg ~ Treatment, data = D)
+betatreatment.grass = betadisper(ps.bg, D$Treatment)
+permutest(betatreatment.grass)
+
+#betadisper graph of grass
+png("betatreatment.png", width = 7, height = 8.2, units = "in", res = 600)
+par(family="Times")
+plot(betatreatment.grass, col = c("#E69F00", "#56B4E9", "#CC79A7"), hull = FALSE, ellipse = TRUE)
+dev.off()
+
+#PERMANOVA and betadisper of soil
+adonis(ps.bs ~ Treatment, data = D1)
+betatreatment.soil = betadisper(ps.bs, D1$Treatment)
+permutest(betatreatment.soil)
+
+#betadisper graph of soil
+png("betatreatmentsoil.png", width = 7, height = 8.2, units = "in", res = 600)
+par(family="Times")
+plot(betatreatment.soil, col = c("#E69F00", "#56B4E9", "#CC79A7"), hull = FALSE, ellipse = TRUE)
+dev.off()
+
+#NMDS of treatment for grass plots 
+ord.nmds.bray <- ordinate(ps.grass, method = "NMDS", k=3, distance = "bray")
+p3 = plot_ordination(ps.grass, ord.nmds.bray, color="Treatment") + 
+  stat_ellipse(aes(fill = NA), geom = "polygon", show.legend = FALSE) + 
+  scale_fill_manual(values = cbbPalette) + 
+  theme_bw(base_size=11, base_family="Times") + 
+  scale_colour_manual(values=cbbPalette) + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  theme(legend.title = element_blank())
+p3
+ggsave("toxicitygrass.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+#NMDS of treatment for soil plots 
+ord.nmds.bray <- ordinate(ps.soil, method = "NMDS", k=3, distance = "bray")
+p4 = plot_ordination(ps.soil, ord.nmds.bray, color="Treatment") + 
+  stat_ellipse(aes(fill = NA), geom = "polygon", show.legend = FALSE) +
+  scale_fill_manual(values = cbbPalette) + 
+  theme_bw(base_size=11, base_family="Times") + 
+  scale_colour_manual(values=cbbPalette) + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  theme(legend.title = element_blank())
+p4
+ggsave("toxicitysoil.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+#Deseq2 analysis
+library("DESeq2")
+library("plyr")
+
+#subsetting grass plots 
+ps.grass = subset_samples(ps, Plot == "Grass")
+#subsetting soil plots 
+ps.soil = subset_samples(ps, Plot == "Soil")
+
+#Looking at grass samples compared to the non-treated control
+sample.data = sample_data(ps.grass)
+
+Dif_Abund = function(Treatment, Time){
+  ps.pruned <- prune_samples(((sample_data(ps.grass)$Treatment_F == Treatment) & (sample_data(ps.grass)$Time_F == Time)) | ((sample_data(ps.grass)$Treatment_F == "Nontreated") & (sample_data(ps.grass)$Time_F == Time)),ps.grass)
+  dseq = phyloseq_to_deseq2(ps.pruned, ~ Treatment)
+  dseq$Treatment = relevel(dseq$Treatment,"Nontreated")
+  dseq = DESeq(dseq, quiet = TRUE, fitType="local")
+  taxonomy = data.frame(tax_table(ps.pruned))
+  results = results(dseq)
+  results$Time = Time
+  results$Treatment = Treatment
+  results = data.frame(results$Time,results$Treatment,rownames(results),results$baseMean,results$log2FoldChange,results$lfcSE,results$pvalue,taxonomy)
+  colnames(results)[1:7] = c("Time","Treatment","OTU","baseMean","l2FC","SE","pvalue")
+  results
+}
+
+variables = expand.grid(Treatment = c("Boscalid", "Chlorothalonil"), Time = c("Day_0", "Day_1", "Day_3", "Day_7", "Day_14", "Day_21"))
+variables
+
+DA<-mdply(variables,Dif_Abund)
+head(DA)
+
+threshold = function (thresh){
+  dplyr::filter(DA, baseMean >= thresh) %>% 
+    dplyr::mutate(padj = p.adjust(pvalue,"BH")) %>%
+    dplyr::summarize(cutoff=thresh, count=sum(padj<=0.10, na.rm = TRUE))
+}
+
+range = seq(0,3,0.05)
+thresh.s <- ldply(range, threshold)
+plot(thresh.s$count~thresh.s$cutoff)
+
+group_by(DA, Treatment) %>%
+  mutate(Total=sum(baseMean)) %>%
+  filter(baseMean>=0.1) %>% 
+  mutate(padj = p.adjust(pvalue,"BH")) %>% 
+  write.csv("Treatgrass.csv", row.names=FALSE)
+
+N=read.csv("Treatgrass.csv")
+ggplot(N) + geom_point(aes(x = Phylum, y = l2FC, color = padj)) + facet_grid(Time~Treatment) + theme(axis.text.x = element_text(angle = 90, hjust = 1)) + scale_colour_gradient2(low = "black", mid = "black", high = "lightgray", midpoint = 0.05, space = "Lab", guide = "colourbar")
+
+
+N.1 = subset(N, padj <= 0.1)
+N.1$Time = factor(N.1$Time, levels = c("Day_0", "Day_1", "Day_3", "Day_7", "Day_14", "Day_21"))
+N.1$Treatment = factor(N.1$Treatment, levels = c("Boscalid", "Chlorothalonil"))
+ggplot(N.1) + geom_point(aes(x = Genus, y = l2FC), size = 4) + facet_grid(Time~Treatment) + theme(axis.text.x = element_text(angle = 90, hjust = 1)) + xlab("")
+ggsave("Dif_Rel_Phylum_GF.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+#Looking at soil plots compared to non-treated control
+sample.data = sample_data(ps.soil)
+
+Dif_Abund = function(Treatment, Time){
+  ps.pruned <- prune_samples(((sample_data(ps.soil)$Treatment_F == Treatment) & (sample_data(ps.soil)$Time_F == Time)) | ((sample_data(ps.soil)$Treatment_F == "Nontreated") & (sample_data(ps.soil)$Time_F == Time)),ps.soil)
+  dseq = phyloseq_to_deseq2(ps.pruned, ~ Treatment)
+  dseq$Treatment = relevel(dseq$Treatment,"Nontreated")
+  dseq = DESeq(dseq, quiet = TRUE, fitType="local")
+  taxonomy = data.frame(tax_table(ps.pruned))
+  results = results(dseq)
+  results$Time = Time
+  results$Treatment = Treatment
+  results = data.frame(results$Time,results$Treatment,rownames(results),results$baseMean,results$log2FoldChange,results$lfcSE,results$pvalue,taxonomy)
+  colnames(results)[1:7] = c("Time","Treatment","OTU","baseMean","l2FC","SE","pvalue")
+  results
+}
+
+variables = expand.grid(Treatment = c("Boscalid", "Chlorothalonil"), Time = c("Day_0", "Day_1", "Day_3", "Day_7", "Day_14", "Day_21"))
+variables
+
+DA<-mdply(variables,Dif_Abund)
+head(DA)
+
+threshold = function (thresh){
+  dplyr::filter(DA, baseMean >= thresh) %>% 
+    dplyr::mutate(padj = p.adjust(pvalue,"BH")) %>%
+    dplyr::summarize(cutoff=thresh, count=sum(padj<=0.10, na.rm = TRUE))
+}
+
+range = seq(0,3,0.05)
+thresh.s <- ldply(range, threshold)
+plot(thresh.s$count~thresh.s$cutoff)
+
+group_by(DA, Treatment) %>%
+  mutate(Total=sum(baseMean)) %>%
+  filter(baseMean>=0.1) %>% 
+  mutate(padj = p.adjust(pvalue,"BH")) %>% 
+  write.csv("Treatsoil.csv", row.names=FALSE)
+
+N=read.csv("Treatsoil.csv")
+ggplot(N) + geom_point(aes(x = Phylum, y = l2FC, color = padj)) + facet_grid(Time~Treatment) + theme(axis.text.x = element_text(angle = 90, hjust = 1)) + scale_colour_gradient2(low = "black", mid = "black", high = "lightgray", midpoint = 0.05, space = "Lab", guide = "colourbar") + ggtitle("Log2 Fold Change of Managed Grass Species to a Natural Setting")
+
+
+N.1 = subset(N, padj <= 0.1)
+N.1$Time = factor(N.1$Time, levels = c("Day_0", "Day_1", "Day_3", "Day_7", "Day_14", "Day_21"))
+N.1$Treatment = factor(N.1$Treatment, levels = c("Boscalid", "Chlorothalonil"))
+ggplot(N.1) + geom_point(aes(x = Genus, y = l2FC), size = 4) + facet_grid(Time~Treatment) + theme(axis.text.x = element_text(angle = 90, hjust = 1)) + xlab("")
+ggsave("Dif_Rel_Genus_soiltreat.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+##objective three analysis##
+
+#color palette for objective 3 
+cbbPalette <- c("#F0E442", "#0072B2", "#663399", "#66CC99", "#CC99FF", "#009999")
+
+#PERMANOVA test and betadisper of time for grass plots
+adonis(ps.bg ~Time, data = D)
+betatime = betadisper(ps.bg, D$Time)
+permutest(betatime)
+
+#betadisper plot for grass plots 
+png("betatimegrass.png", width = 7, height = 8.2, units = "in", res = 600)
+par(family="Times")
+plot(betatime, col = c("#F0E442", "#0072B2", "#663399", "#66CC99", "#CC99FF", "#009999"), hull = FALSE, ellipse = TRUE)
+dev.off()
+
+#NMDS of time for grass plots 
+ord.nmds.bray <- ordinate(ps.grass, method = "NMDS", k=3, distance = "bray")
+p2 = plot_ordination(ps.grass, ord.nmds.bray, color="Time") + 
+  stat_ellipse(aes(fill = NA), geom = "polygon", show.legend = FALSE) + 
+  scale_fill_manual(values = cbbPalette) + 
+  theme_bw(base_size=11, base_family="Times") + 
+  scale_colour_manual(values=cbbPalette) + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(legend.title = element_blank())
+p2 = p2 + facet_wrap(~Treatment)
+p2
+ggsave("timegrass.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+#PERMANOVA test and betadisper of time for soil plots 
+adonis(ps.bs ~Time, data = D1)
+betatime = betadisper(ps.bs, D1$Time)
+permutest(betatime)
+
+#betadisper graph for soil plots 
+png("betatime.png", width = 7, height = 8.2, units = "in", res = 600)
+par(family="Times")
+plot(betatime, col = c("#F0E442", "#0072B2", "#663399", "#66CC99", "#CC99FF", "#009999"), hull = FALSE, ellipse = TRUE)
+dev.off()
+
+#NMDS graph of time for soil plots 
+ord.nmds.bray <- ordinate(ps.soil, method = "NMDS", k=3, distance = "bray")
+p5 = plot_ordination(ps.soil, ord.nmds.bray, color="Time") + 
+  stat_ellipse(aes(fill = NA), geom = "polygon", show.legend = FALSE) + 
+  scale_fill_manual(values = cbbPalette) + 
+  theme_bw(base_size=11, base_family="Times") + 
+  scale_colour_manual(values=cbbPalette) + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(legend.title = element_blank())
+p5 = p5 + facet_wrap(~Treatment)
+p5
+ggsave("timesoil.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+
+#color palette for alpha diversity 
+cbbPalette <- c("#E69F00", "#56B4E9", "#CC79A7")
+
+#alpha diversity 
+plot_richness(ps.norm, measures = "Shannon", color = "Treatment", x = "Time") + 
+  geom_boxplot() + facet_grid(Plot~.) + 
+  theme_bw(base_size=11, base_family="Times") + 
+  scale_colour_manual(values=cbbPalette) 
+ggsave("alpha.png", width = 7, height = 8.2, units = "in", dpi = 600)
+
+
